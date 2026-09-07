@@ -93,6 +93,33 @@ def stats() -> None:
 
 
 @app.command()
+def demo(
+    kind: str = typer.Option("echo", "--kind"),
+    payload: str = typer.Option("{}", "--payload", help="JSON object"),
+    max_attempts: int = typer.Option(3, "--max-attempts"),
+    log_level: str = log_level_opt,
+) -> None:
+    """Enqueue and handle one job in this process.
+
+    Use this with ``EWA_QUEUE_BACKEND=memory`` — that backend is
+    process-local and does not survive a second CLI invocation.
+    """
+    _configure_logging(log_level)
+    settings = load_settings()
+    queue = build_queue(settings)
+    body: dict[str, Any] = json.loads(payload)
+    job = queue.enqueue(kind, body, max_attempts=max_attempts)
+    typer.echo(f"enqueued {job.id} kind={job.kind}")
+    worker = Worker(queue, settings)
+    handled = worker.run_once()
+    if handled is None:
+        typer.echo("worker saw an empty queue")
+        raise typer.Exit(code=1)
+    latest = queue.get(handled.id)
+    typer.echo(latest.model_dump_json(indent=2) if latest else handled.id)
+
+
+@app.command()
 def bench(
     n: int = typer.Option(200, "--n", help="Jobs to enqueue/claim/ack"),
 ) -> None:

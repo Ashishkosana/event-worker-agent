@@ -10,35 +10,6 @@ from event_worker.clock import Clock, SystemClock
 from event_worker.errors import JobNotFoundError, JobStateError, StaleLeaseError
 from event_worker.models import Job, JobStatus, QueueStats
 
-# Atomic: promote delayed, reclaim expired leases, pop ready, mark inflight.
-_CLAIM_LUA = """
-local ready = KEYS[1]
-local delayed = KEYS[2]
-local inflight = KEYS[3]
-local now = tonumber(ARGV[1])
-local lease_until = tonumber(ARGV[2])
-local max_scan = tonumber(ARGV[3])
-
-local due = redis.call('ZRANGEBYSCORE', delayed, '-inf', now, 'LIMIT', 0, max_scan)
-for _, id in ipairs(due) do
-  redis.call('ZREM', delayed, id)
-  redis.call('RPUSH', ready, id)
-end
-
-local expired = redis.call('ZRANGEBYSCORE', inflight, '-inf', now, 'LIMIT', 0, max_scan)
-for _, id in ipairs(expired) do
-  redis.call('ZREM', inflight, id)
-  redis.call('RPUSH', ready, id)
-end
-
-local job_id = redis.call('LPOP', ready)
-if not job_id then
-  return false
-end
-redis.call('ZADD', inflight, lease_until, job_id)
-return job_id
-"""
-
 
 class RedisQueue:
     """Redis backend with the same claim / lease / DLQ contract as memory."""
@@ -55,7 +26,6 @@ class RedisQueue:
         self._clock = clock or SystemClock()
         self._prefix = prefix
         self._completed_keep = completed_keep
-        self._claim_script = client.register_script(_CLAIM_LUA)
 
     def _k(self, name: str) -> str:
         return f"{self._prefix}:{name}"
@@ -112,12 +82,12 @@ class RedisQueue:
     def claim(self, worker_id: str, *, lease_seconds: float = 30.0) -> Job | None:
         now = self._clock.now()
         lease_until = now + timedelta(seconds=lease_seconds)
-        job_id = self._claim_script(
-            keys=[self._k("ready"), self._k("delayed"), self._k("inflight")],
-            args=[now.timestamp(), lease_until.timestamp(), 200],
-        )
+        self.reclaim_expired()
+        self.promote_delayed()
+        job_id = self._r.lpop(self._k("ready"))
         if not job_id:
             return None
+        self._r.zadd(self._k("inflight"), {job_id: lease_until.timestamp()})
         job = self._load(job_id)
         if job is None:
             self._r.zrem(self._k("inflight"), job_id)

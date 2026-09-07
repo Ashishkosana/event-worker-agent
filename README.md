@@ -125,12 +125,14 @@ ruff check src tests
 event-worker bench --n 200   # labeled local in-memory timings
 ```
 
-In-memory worker (no Redis):
+In-process demo (no Redis). The memory backend is **process-local** — use `demo` so enqueue and claim share one queue:
 
 ```bash
-EWA_QUEUE_BACKEND=memory event-worker enqueue --kind echo --payload '{"message":"hi"}'
-EWA_QUEUE_BACKEND=memory event-worker worker --once
+EWA_QUEUE_BACKEND=memory event-worker demo --kind echo --payload '{"message":"hi"}'
+EWA_QUEUE_BACKEND=memory event-worker demo --kind poison --payload '{}'
 ```
+
+Across processes (enqueue API + worker), use Redis via Compose below.
 
 ### Docker Compose
 
