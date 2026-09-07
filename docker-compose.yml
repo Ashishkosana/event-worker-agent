@@ -1,0 +1,36 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+  api:
+    build: .
+    command: ["event-worker", "serve", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      EWA_QUEUE_BACKEND: redis
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: .
+    command: ["event-worker", "worker"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      EWA_QUEUE_BACKEND: redis
+      EWA_LEASE_SECONDS: "30"
+      EWA_BACKOFF_BASE_SECONDS: "1"
+      EWA_POLL_INTERVAL: "0.5"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
