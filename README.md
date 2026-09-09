@@ -49,7 +49,7 @@ Spirit of tick / ledgerline: **claiming, leases, retries, DLQ**. The worker is a
        ▼
 ┌──────────────────────────────────────────────┐
 │  JobHandler                                  │
-│   AgentPolicy.select_tools()   YOU IMPLEMENT │
+│   AgentPolicy.select_tools()   shipped brain │
 │   MockToolRuntime.invoke()                   │
 │   AgentPolicy.classify()       retry vs DLQ  │
 └──────────────────────────────────────────────┘
@@ -73,34 +73,47 @@ When a JD says *event-driven*, *SQS*, *workers*, *retries*, *DLQ*:
 
 What I would say I have **not** built: cross-AZ replication, exactly-once sinks, schema registry, or Kafka consumer lag dashboards.
 
-## YOU IMPLEMENT — agent policy
+## Agent policy (shipped)
 
-The queue, worker loop, leases, backoff, and DLQ are done.
+The queue, worker loop, leases, backoff, and DLQ are in place. The **tool-calling brain** is a deterministic `AgentPolicy` — not a hosted LLM, and not `NotImplemented`.
 
-The **agent tool-calling brain** lives in `src/event_worker/agent/`:
+CI stays offline. `select_tools` / `classify` are table-driven so retry and DLQ are replayable.
 
 | File | Role |
 | --- | --- |
-| [`policy.py`](src/event_worker/agent/policy.py) | **Implemented.** `select_tools(job)` builds an ordered `ToolCall` list from `kind`. `classify(job, results)` is the retry/DLQ authority (`success` / `retryable` / `terminal`). |
-| [`tools.py`](src/event_worker/agent/tools.py) | **Implemented mock runtime.** `echo`, `normalize_event`, `classify_intent`, `call_downstream`, `record_result`, `flaky_downstream`, `raise_poison`. |
-| [`planner.py`](src/event_worker/agent/planner.py) | **Stub.** `LLMPlanner.plan()` raises `NotImplementedError`. Swap this in later; keep `classify()` deterministic. |
+| [`policy.py`](src/event_worker/agent/policy.py) | **Shipped.** `select_tools(job, results=None)` returns the remaining `ToolCall` list (arguments bound from prior tool output). `ticket` can insert `call_downstream` after intent. `classify(job, results)` is the only retry/DLQ authority (`success` / `retryable` / `terminal`). Unknown tools and `raise_poison` are terminal even if a tool hints retryable. |
+| [`tools.py`](src/event_worker/agent/tools.py) | **Mock runtime.** `echo`, `normalize_event`, `classify_intent`, `call_downstream`, `record_result`, `flaky_downstream`, `raise_poison`. |
+| [`planner.py`](src/event_worker/agent/planner.py) | **Stub.** `LLMPlanner.plan()` raises `NotImplementedError`. Not on the worker path. Swap this in later; keep `classify()` deterministic. |
 
-Job kinds the policy already handles:
+Job kinds the policy handles:
 
 | `kind` | Tools | Typical outcome |
 | --- | --- | --- |
 | `echo` | echo → record_result | success |
 | `normalize` | normalize_event → record_result | success |
 | `classify` | normalize → classify_intent → record | success (keyword intent) |
+| `ticket` | normalize → classify_intent → (optional downstream) → record | `refund` / `alert` call mock downstream |
 | `notify` | normalize → call_downstream → record | retryable if URL ends with `fail.invalid` |
 | `transient` | flaky_downstream → record | retry until `payload.succeed_on_attempt` |
 | `poison` | raise_poison | terminal DLQ on first attempt |
 | anything else | — | terminal (`unknown job kind`) |
 
-Extension points (not required for Milestone 1):
+Worker tests cover the real policy (not queue `fail()` stubs):
+
+- claim → tools → ack (`echo`, `classify`, `ticket`)
+- retryable failure → delayed backoff → ready (`notify` + `fail.invalid`)
+- terminal / unknown kind / max attempts → DLQ (`poison`, `not-a-kind`)
+
+Print the initial plan without touching a queue:
+
+```bash
+event-worker plan --kind classify --payload '{"text":"please refund order 42"}'
+```
+
+If you later add a model planner:
 
 1. Replace `MockToolRuntime` handlers with real HTTP / DB tools.
-2. Implement `LLMPlanner.plan()` to emit `ToolCall[]`. Reject unknown names as **terminal**.
+2. Implement `LLMPlanner.plan()` to emit `ToolCall[]`. Unknown names stay **terminal**.
 3. Keep `AgentPolicy.classify()` as the only path that can mark a job retryable.
 
 ## Milestone 1 checklist
@@ -108,10 +121,11 @@ Extension points (not required for Milestone 1):
 - [x] Job model + enqueue API and CLI
 - [x] Worker loop that claims with a visibility timeout / lease
 - [x] Mock tool calls on the job payload
+- [x] Deterministic `AgentPolicy` (select tools, classify success / retry / DLQ)
 - [x] Failure → retry with backoff → DLQ after N attempts
 - [x] Docker Compose: Redis + API + worker
-- [x] pytest for claim / lease / retry / DLQ / policy
-- [x] README: architecture, interview bridge, YOU IMPLEMENT
+- [x] pytest for claim / lease / retry / DLQ / policy (including worker-path policy tests)
+- [x] README: architecture, interview bridge, shipped policy
 
 ## Run
 
@@ -128,8 +142,10 @@ event-worker bench --n 200   # labeled local in-memory timings
 In-process demo (no Redis). The memory backend is **process-local** — use `demo` so enqueue and claim share one queue:
 
 ```bash
+event-worker plan --kind ticket --payload '{"text":"please refund order 42"}'
 EWA_QUEUE_BACKEND=memory event-worker demo --kind echo --payload '{"message":"hi"}'
 EWA_QUEUE_BACKEND=memory event-worker demo --kind poison --payload '{}'
+EWA_QUEUE_BACKEND=memory event-worker demo --kind ticket --payload '{"text":"please refund order 42"}'
 ```
 
 Across processes (enqueue API + worker), use Redis via Compose below.
@@ -167,7 +183,7 @@ curl -s localhost:8000/v1/queue/dlq
 | `GET` | `/v1/queue/dlq` | dead letters |
 | `POST` | `/v1/queue/dlq/{id}/requeue` | reset attempts, put back on ready |
 
-CLI: `event-worker serve` · `event-worker worker` · `event-worker enqueue` · `event-worker stats`.
+CLI: `event-worker serve` · `event-worker worker` · `event-worker enqueue` · `event-worker stats` · `event-worker plan` · `event-worker demo`.
 
 Env (see `.env.example`): `REDIS_URL`, `EWA_QUEUE_BACKEND`, `EWA_LEASE_SECONDS`, `EWA_BACKOFF_*`.
 
@@ -184,14 +200,14 @@ src/event_worker/
   models.py           Job, ToolCall, HandlerDecision
   queues/             InMemory + Redis (claim, lease, DLQ)
   backoff.py          exponential delay
-  agent/policy.py     implemented tool-calling policy
+  agent/policy.py     shipped tool-calling policy
   agent/tools.py      mock tools
-  agent/planner.py    LLM stub
+  agent/planner.py    LLM stub (not on the worker path)
   handler.py          policy + tools
   worker.py           claim loop
   api.py              FastAPI
   cli.py              typer
-tests/                claim, lease, retry/DLQ, policy, API
+tests/                claim, lease, retry/DLQ, policy, worker-policy, API
 ```
 
 ## License

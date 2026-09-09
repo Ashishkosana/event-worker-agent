@@ -7,7 +7,7 @@ class LLMPlanner:
     """Stub for a model that emits ``ToolCall`` lists.
 
     Do **not** use this on the default worker path. ``AgentPolicy.select_tools``
-    is the implemented planner. Keep ``AgentPolicy.classify`` as the
+    is the shipped planner. Keep ``AgentPolicy.classify`` as the
     retry / DLQ authority so a flaky model cannot loop a poison job forever.
 
     To implement later:
