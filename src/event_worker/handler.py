@@ -6,7 +6,7 @@ from event_worker.models import HandlerDecision, Job, Outcome, ToolResult
 
 
 class JobHandler:
-    """Claimed-job → tool calls → ack/retry/DLQ decision."""
+    """Claimed-job → policy selects tools → invoke → policy classifies."""
 
     def __init__(
         self,
@@ -17,16 +17,22 @@ class JobHandler:
         self.runtime = runtime or MockToolRuntime()
 
     def handle(self, job: Job) -> HandlerDecision:
-        calls = self.policy.select_tools(job)
-        if not calls:
-            return self.policy.classify(job, [])
-
         results: list[ToolResult] = []
-        for call in calls:
-            result = self.runtime.invoke(call, job)
+        for _ in range(self.policy.max_steps):
+            calls = self.policy.select_tools(job, results)
+            if not calls:
+                return self.policy.classify(job, results)
+            result = self.runtime.invoke(calls[0], job)
             results.append(result)
             if not result.ok:
-                break
+                return self.policy.classify(job, results)
+        leftover = self.policy.select_tools(job, results)
+        if leftover:
+            return HandlerDecision(
+                outcome=Outcome.TERMINAL,
+                error="policy exceeded max tool steps",
+                tool_trace=[result.as_trace() for result in results],
+            )
         return self.policy.classify(job, results)
 
 

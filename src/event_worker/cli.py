@@ -7,6 +7,7 @@ from typing import Any
 import typer
 import uvicorn
 
+from event_worker.agent.policy import AgentPolicy
 from event_worker.bench import run_bench
 from event_worker.config import load_settings
 from event_worker.queues import build_queue
@@ -116,7 +117,25 @@ def demo(
         typer.echo("worker saw an empty queue")
         raise typer.Exit(code=1)
     latest = queue.get(handled.id)
-    typer.echo(latest.model_dump_json(indent=2) if latest else handled.id)
+    if latest is None:
+        typer.echo(handled.id)
+        return
+    names = " -> ".join(step.get("name", "?") for step in latest.tool_trace) or "(none)"
+    typer.echo(f"tools {names}")
+    typer.echo(f"status {latest.status} attempts={latest.attempts}")
+    if latest.last_error:
+        typer.echo(f"error {latest.last_error}")
+    typer.echo(latest.model_dump_json(indent=2))
+
+
+@app.command()
+def plan(
+    kind: str = typer.Option("echo", "--kind"),
+    payload: str = typer.Option("{}", "--payload", help="JSON object"),
+) -> None:
+    """Print the deterministic AgentPolicy tool plan. No queue I/O, no LLM."""
+    body: dict[str, Any] = json.loads(payload)
+    typer.echo(json.dumps(AgentPolicy().preview(kind, body), indent=2))
 
 
 @app.command()
